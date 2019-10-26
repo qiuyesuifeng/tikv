@@ -7,12 +7,15 @@ use futures::Stream;
 use futures::{self, Future};
 use hyper::service::service_fn;
 use hyper::{self, header, Body, Method, Request, Response, Server, StatusCode};
+use protobuf::Message;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_threadpool::{Builder, ThreadPool};
 
+use std::borrow::Borrow;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use super::Result;
 use crate::config::TiKvConfig;
@@ -20,6 +23,8 @@ use tikv_alloc::error::ProfError;
 use tikv_util::collections::HashMap;
 use tikv_util::metrics::dump;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+
+const MAX_SEARCH_LOG_RESULT_SIZE: usize = 1 << 7;
 
 mod profiler_guard {
     use tikv_alloc::error::ProfResult;
@@ -144,9 +149,13 @@ impl StatusServer {
         }))
     }
 
-    pub fn dump_prof_to_resp(
+    pub fn dump_prof_to_resp<F>(
+        func: F,
         req: Request<Body>,
-    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>
+    where
+        F: Fn(u64) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send>,
+    {
         let query = match req.uri().query() {
             Some(query) => query,
             None => {
@@ -173,7 +182,7 @@ impl StatusServer {
         };
 
         Box::new(
-            Self::dump_prof(seconds)
+            func(seconds)
                 .and_then(|buf| {
                     let response = Response::builder()
                         .header("X-Content-Type-Options", "nosniff")
@@ -194,6 +203,41 @@ impl StatusServer {
         )
     }
 
+    pub fn dump_cpu_prof(
+        seconds: u64,
+    ) -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
+        let guard = match rsperftools::ProfilerGuard::new(100) {
+            Ok(guard) => guard,
+            Err(_) => return Box::new(err(ProfError::CpuProfilingLockFailed)),
+        };
+        let timer = GLOBAL_TIMER_HANDLE.clone();
+        Box::new(
+            timer
+                .delay(std::time::Instant::now() + std::time::Duration::from_secs(seconds))
+                .then(
+                    move |_| -> Box<dyn Future<Item = Vec<u8>, Error = ProfError> + Send> {
+                        let result = match guard.report() {
+                            Ok(report) => {
+                                info!("get cpu profile report successfully");
+                                match report.pprof().map(|profile| profile.write_to_bytes()) {
+                                    Ok(body) => ok(body.unwrap()),
+                                    Err(e) => {
+                                        warn!("report profiling failed: {:?}", e);
+                                        err(ProfError::CPUProfilingReportFailed)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("report profiling failed: {:?}", e);
+                                err(ProfError::CPUProfilingReportFailed)
+                            }
+                        };
+                        Box::new(result)
+                    },
+                ),
+        )
+    }
+
     fn config_handler(
         config: Arc<TiKvConfig>,
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
@@ -210,16 +254,174 @@ impl StatusServer {
         Box::new(ok(res))
     }
 
+    pub fn log_open(
+        log_iters: &Arc<Mutex<HashMap<String, log::LogIterator>>>,
+        config: Arc<TiKvConfig>,
+        req: Request<Body>,
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+        if config.log_file.is_empty() {
+            let res = Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    "TiKV cannot provide log service because of the log output to terminal",
+                ))
+                .unwrap();
+            return Box::new(ok(res));
+        }
+
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        let begin_time: i64 = match query_pairs.get("begin_time") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap();
+                    return Box::new(ok(response));
+                }
+            },
+            None => 0,
+        };
+        let end_time: i64 = match query_pairs.get("end_time") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap();
+                    return Box::new(ok(response));
+                }
+            },
+            None => std::i64::MAX,
+        };
+        let level: Option<log::Level> = match query_pairs.get("level") {
+            Some(val) => log::Level::from_str(val),
+            None => None,
+        };
+        let filter = query_pairs.get("filter").map_or("", |s| s.borrow());
+
+        match log::LogIterator::new(
+            &config.log_file,
+            begin_time,
+            end_time,
+            level,
+            filter.to_string(),
+        ) {
+            Ok(iter) => {
+                let name = format!("token-{}", chrono::offset::Utc::now().timestamp_nanos());
+                log_iters.lock().unwrap().insert(name.clone(), iter);
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(name))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+            Err(err) => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!("{:?}", err)))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+        }
+    }
+
+    pub fn log_next(
+        log_iters: &Arc<Mutex<HashMap<String, log::LogIterator>>>,
+        req: Request<Body>,
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        let token = query_pairs.get("token").map_or("", |s| s.borrow());
+        let limit: usize = match query_pairs.get("limit") {
+            Some(val) => match val.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    let response = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap();
+                    return Box::new(ok(response));
+                }
+            },
+            None => MAX_SEARCH_LOG_RESULT_SIZE,
+        };
+        match log_iters.lock().unwrap().get_mut(token) {
+            Some(iter) => {
+                let mut counter = 0;
+                let mut results = vec![];
+                for line in iter {
+                    results.push(line);
+                    counter += 1;
+                    if counter >= limit {
+                        break;
+                    }
+                }
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&results).unwrap()))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+            None => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(format!(
+                        "the {:?} dose not open or closed",
+                        token
+                    )))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+        }
+    }
+
+    pub fn log_close(
+        log_iters: &Arc<Mutex<HashMap<String, log::LogIterator>>>,
+        req: Request<Body>,
+    ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+        let query = req.uri().query().unwrap_or("");
+        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        let token = query_pairs.get("token").map_or("", |s| s.borrow());
+        match log_iters.lock().unwrap().remove(token) {
+            Some(_) => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("sucess"))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+            None => {
+                let res = Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(format!(
+                        "the {:?} dose not open or closed",
+                        token
+                    )))
+                    .unwrap();
+                Box::new(ok(res))
+            }
+        }
+    }
+
     pub fn start(&mut self, status_addr: String) -> Result<()> {
         let addr = SocketAddr::from_str(&status_addr)?;
 
         // TODO: support TLS for the status server.
         let builder = Server::try_bind(&addr)?;
         let config = self.config.clone();
+        let log_iters: Arc<Mutex<HashMap<String, log::LogIterator>>> = Default::default();
 
         // Start to serve.
         let server = builder.serve(move || {
             let config = config.clone();
+            let log_iters = Arc::clone(&log_iters);
             // Create a status service.
             service_fn(
                     move |req: Request<Body>| -> Box<
@@ -238,8 +440,18 @@ impl StatusServer {
                         match (method, path.as_ref()) {
                             (Method::GET, "/metrics") => Box::new(ok(Response::new(dump().into()))),
                             (Method::GET, "/status") => Box::new(ok(Response::default())),
-                            (Method::GET, "/pprof/profile") => Self::dump_prof_to_resp(req),
+                            (Method::GET, "/pprof/profile") => {
+                                Self::dump_prof_to_resp(Self::dump_prof, req)
+                            }
+                            (Method::GET, "/pprof/cpu") => {
+                                Self::dump_prof_to_resp(Self::dump_cpu_prof, req)
+                            }
                             (Method::GET, "/config") => Self::config_handler(config.clone()),
+                            (Method::GET, "/log/open") => {
+                                Self::log_open(&log_iters, config.clone(), req)
+                            }
+                            (Method::GET, "/log/next") => Self::log_next(&log_iters, req),
+                            (Method::GET, "/log/close") => Self::log_close(&log_iters, req),
                             _ => Box::new(ok(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
                                 .body(Body::empty())
@@ -345,6 +557,344 @@ fn handle_fail_points_request(
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(Body::empty())
             .unwrap())),
+    }
+}
+
+mod log {
+    use std::convert::From;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::path::Path;
+
+    use chrono::DateTime;
+    use nom::bytes::complete::{tag, take, take_until};
+    use nom::character::complete::{alpha1, space0, space1};
+    use nom::sequence::tuple;
+    use nom::*;
+    use rev_lines;
+    use walkdir::WalkDir;
+
+    const INVALID_TIMESTAMP: i64 = -1;
+    const TIMESTAMP_LENGTH: usize = 30;
+
+    pub struct LogIterator {
+        search_files: Vec<(i64, File)>,
+        currrent_lines: Option<std::io::Lines<BufReader<File>>>,
+
+        // filter conditions
+        begin_time: i64,
+        end_time: i64,
+        level: Option<Level>,
+        filter: String,
+    }
+
+    #[derive(Debug)]
+    pub struct LogSearchError(String);
+
+    impl From<walkdir::Error> for LogSearchError {
+        fn from(e: walkdir::Error) -> Self {
+            LogSearchError(format!("walk directory: {:?}", e))
+        }
+    }
+
+    impl LogIterator {
+        pub fn new(
+            log_file: &str,
+            begin_time: i64,
+            end_time: i64,
+            level: Option<Level>,
+            filter: String,
+        ) -> Result<Self, LogSearchError> {
+            let log_path: &Path = log_file.as_ref();
+            let log_name = match log_path.file_name() {
+                Some(file_name) => match file_name.to_str() {
+                    Some(file_name) => file_name,
+                    None => return Err(LogSearchError(format!("Invalid utf8: {}", log_file))),
+                },
+                None => return Err(LogSearchError(format!("Illegal file name: {}", log_file))),
+            };
+            let log_dir = match log_path.parent() {
+                Some(dir) => dir,
+                None => return Err(LogSearchError(format!("illegal parent dir: {}", log_file))),
+            };
+
+            let mut search_files = vec![];
+            for entry in WalkDir::new(log_dir) {
+                let entry = entry?;
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let file_name = match entry.file_name().to_str() {
+                    Some(file_name) => file_name,
+                    None => continue,
+                };
+                // Rorated file name have the same prefix with the original file name
+                if !file_name.starts_with(log_name) {
+                    continue;
+                }
+                // Open the file
+                let mut file = match File::open(entry.path()) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+
+                let (file_start_time, file_end_time) = match parse_time_range(&file) {
+                    Ok((file_start_time, file_end_time)) => (file_start_time, file_end_time),
+                    Err(_) => continue,
+                };
+
+                if (begin_time < file_start_time && end_time > file_start_time)
+                    || (end_time > file_end_time && begin_time < file_end_time)
+                {
+                    if let Err(err) = file.seek(SeekFrom::Start(0)) {
+                        warn!("seek file failed: {}, err: {}", file_name, err);
+                        continue;
+                    }
+                    search_files.push((file_start_time, file));
+                }
+            }
+            search_files.sort_by(|a, b| b.0.cmp(&a.0));
+            let current_reader = search_files.pop().map(|file| BufReader::new(file.1));
+            Ok(Self {
+                search_files,
+                currrent_lines: current_reader.map(|reader| reader.lines()),
+                begin_time,
+                end_time,
+                level,
+                filter,
+            })
+        }
+    }
+
+    impl Iterator for LogIterator {
+        type Item = LogItem;
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                match &mut self.currrent_lines {
+                    Some(lines) => {
+                        loop {
+                            let line = match lines.next() {
+                                Some(line) => line,
+                                None => {
+                                    self.currrent_lines = self
+                                        .search_files
+                                        .pop()
+                                        .map(|file| BufReader::new(file.1))
+                                        .map(|reader| reader.lines());
+                                    break;
+                                }
+                            };
+                            let input = match line {
+                                Ok(input) => input,
+                                Err(err) => {
+                                    warn!("read line failed: {:?}", err);
+                                    continue;
+                                }
+                            };
+                            if input.len() < TIMESTAMP_LENGTH {
+                                continue;
+                            }
+                            match parse(&input) {
+                                Ok((content, meta)) => {
+                                    // The remain content timestamp more the end time or this file contains inrecognation formation
+                                    if meta.time == INVALID_TIMESTAMP && meta.time > self.end_time {
+                                        break;
+                                    }
+                                    if meta.time < self.begin_time {
+                                        continue;
+                                    }
+                                    if self.level.is_some() && meta.level != self.level {
+                                        continue;
+                                    }
+                                    if self.filter.len() > 0 && !content.contains(&self.filter) {
+                                        continue;
+                                    }
+                                    return Some(LogItem {
+                                        time: meta.time,
+                                        level: meta.level,
+                                        content: String::from(content),
+                                    });
+                                }
+                                Err(err) => {
+                                    warn!("parse line failed: {:?}", err);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            None
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Level {
+        /// Critical
+        Critical,
+        /// Error
+        Error,
+        /// Warning
+        Warning,
+        /// Info
+        Info,
+        /// Debug
+        Debug,
+        /// Trace
+        Trace,
+    }
+
+    #[derive(Debug)]
+    pub enum Error {
+        ParseError,
+        IOError(std::io::Error),
+    }
+
+    impl From<std::io::Error> for Error {
+        fn from(err: std::io::Error) -> Self {
+            Error::IOError(err)
+        }
+    }
+
+    impl Level {
+        pub fn from_str(input: &str) -> Option<Level> {
+            match input {
+                "trace" | "TRACE" => Some(Level::Trace),
+                "debug" | "DEBUG" => Some(Level::Debug),
+                "info" | "INFO" => Some(Level::Info),
+                "warn" | "WARN" | "warning" | "WARNING" => Some(Level::Warning),
+                "error" | "ERROR" => Some(Level::Error),
+                "critical" | "CRITICAL" => Some(Level::Critical),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct LogMeta {
+        pub time: i64,
+        pub level: Option<Level>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct LogItem {
+        pub time: i64,
+        pub level: Option<Level>,
+        pub content: String,
+    }
+
+    fn parse_time(input: &str) -> IResult<&str, &str> {
+        let (input, (_, _, time, _)) =
+            tuple((space0, tag("["), take(TIMESTAMP_LENGTH), tag("]")))(input)?;
+        Ok((input, time))
+    }
+
+    fn parse_level(input: &str) -> IResult<&str, &str> {
+        let (input, (_, _, level, _)) = tuple((space0, tag("["), alpha1, tag("]")))(input)?;
+        Ok((input, level))
+    }
+
+    #[allow(dead_code)]
+    fn parse_file(input: &str) -> IResult<&str, &str> {
+        let (input, (_, _, level, _)) =
+            tuple((space0, tag("["), take_until("]"), tag("]")))(input)?;
+        Ok((input, level))
+    }
+
+    /// Parses the single log line and retrieve the log meta and log body.
+    fn parse(input: &str) -> IResult<&str, LogMeta> {
+        let (content, (time, level, _)) = tuple((parse_time, parse_level, space1))(input)?;
+        Ok((
+            content,
+            LogMeta {
+                time: match DateTime::parse_from_str(time, "%Y/%m/%d %H:%M:%S%.3f %z") {
+                    Ok(t) => t.timestamp_millis(),
+                    Err(_) => -1,
+                },
+                level: Level::from_str(level),
+            },
+        ))
+    }
+
+    /// Parses the start time and end time of a log file and return the maximal and minimal
+    /// timestamp in unix milliseconds.
+    fn parse_time_range(file: &std::fs::File) -> Result<(i64, i64), Error> {
+        let buffer = BufReader::new(file);
+        let file_start_time = match buffer.lines().nth(0) {
+            Some(Ok(line)) => {
+                let (_, meta) = parse(&line).map_err(|_| Error::ParseError)?;
+                meta.time
+            }
+            Some(Err(err)) => {
+                return Err(err.into());
+            }
+            None => INVALID_TIMESTAMP,
+        };
+
+        let buffer = BufReader::new(file);
+        let mut rev_lines = rev_lines::RevLines::with_capacity(512, buffer)?;
+        let file_end_time = match rev_lines.nth(0) {
+            Some(line) => {
+                let (_, meta) = parse(&line).map_err(|_| Error::ParseError)?;
+                meta.time
+            }
+            None => INVALID_TIMESTAMP,
+        };
+
+        Ok((file_start_time, file_end_time))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_time() {
+            assert_eq!(
+                parse_time("[2019/08/23 18:09:52.387 +08:00]"),
+                Ok(("", "2019/08/23 18:09:52.387 +08:00"))
+            );
+            assert_eq!(
+                parse_time(" [2019/08/23 18:09:52.387 +08:00] ["),
+                Ok((" [", "2019/08/23 18:09:52.387 +08:00"))
+            );
+        }
+
+        #[test]
+        fn test_parse_level() {
+            assert_eq!(parse_level("[INFO]"), Ok(("", "INFO")));
+            assert_eq!(parse_level(" [WARN] ["), Ok((" [", "WARN")));
+        }
+
+        #[test]
+        fn test_parse_file() {
+            assert_eq!(parse_file("[foo.rs:100]"), Ok(("", "foo.rs:100")));
+            assert_eq!(parse_file(" [bar.rs:200] ["), Ok((" [", "bar.rs:200")));
+        }
+
+        #[test]
+        fn test_parse() {
+            let cs: Vec<(&str, &str, &str, Option<Level>)> = vec![
+                ("[2019/08/23 18:09:52.387 +08:00] [INFO] [foo.rs:100] [some message] [key=val]", "foo.rs:100", "[some message] [key=val]", Some(Level::Info)),
+                ("[2019/08/23 18:09:52.387 +08:00]    [INFO] [foo.rs:100] [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("[2019/08/23 18:09:52.387 +08:00]    [INFO]     [foo.rs:100] [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [INFO]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [info]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Info)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [warning]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Warning)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [warn]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",Some(Level::Warning)),
+                ("   [2019/08/23 18:09:52.387 +08:00]    [xxx]     [foo.rs:100]    [some message] [key=val]", "foo.rs:100", "[some message] [key=val]",None),
+            ];
+            for (input, file, content, level) in cs.into_iter() {
+                let r = parse(input);
+                assert!(r.is_ok());
+                let log = r.unwrap();
+                assert_eq!(log.0, content);
+                assert_eq!(log.1.level, level);
+                assert_eq!(log.1.file, file);
+            }
+        }
     }
 }
 

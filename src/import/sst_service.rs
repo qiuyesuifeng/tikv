@@ -240,4 +240,13 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                 .then(move |res| send_rpc_response!(res, sink, label, timer))
         }))
     }
+
+    fn download(
+        &mut self,
+        _ctx: ::grpcio::RpcContext,
+        _req: DownloadRequest,
+        _sink: ::grpcio::UnarySink<DownloadResponse>,
+    ) {
+        unimplemented!()
+    }
 }

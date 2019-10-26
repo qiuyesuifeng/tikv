@@ -578,8 +578,8 @@ mod log {
     const TIMESTAMP_LENGTH: usize = 30;
 
     pub struct LogIterator {
-        search_files: Vec<(i64, File)>,
-        currrent_lines: Option<std::io::Lines<BufReader<File>>>,
+        search_files: Vec<(String, i64, File)>,
+        currrent_lines: Option<(String, std::io::Lines<BufReader<File>>)>,
 
         // pattern conditions
         start_time: i64,
@@ -650,14 +650,16 @@ mod log {
                         warn!("seek file failed: {}, err: {}", file_name, err);
                         continue;
                     }
-                    search_files.push((file_start_time, file));
+                    search_files.push((file_name.to_owned(), file_start_time, file));
                 }
             }
             search_files.sort_by(|a, b| b.0.cmp(&a.0));
-            let current_reader = search_files.pop().map(|file| BufReader::new(file.1));
+            let current_reader = search_files
+                .pop()
+                .map(|file| (file.0, BufReader::new(file.2)));
             Ok(Self {
                 search_files,
-                currrent_lines: current_reader.map(|reader| reader.lines()),
+                currrent_lines: current_reader.map(|(filename, reader)| (filename, reader.lines())),
                 start_time,
                 end_time,
                 level,
@@ -671,7 +673,7 @@ mod log {
         fn next(&mut self) -> Option<Self::Item> {
             loop {
                 match &mut self.currrent_lines {
-                    Some(lines) => {
+                    Some((file_name, lines)) => {
                         loop {
                             let line = match lines.next() {
                                 Some(line) => line,
@@ -679,8 +681,8 @@ mod log {
                                     self.currrent_lines = self
                                         .search_files
                                         .pop()
-                                        .map(|file| BufReader::new(file.1))
-                                        .map(|reader| reader.lines());
+                                        .map(|item| (item.0, BufReader::new(item.2)))
+                                        .map(|(filename, reader)| (filename, reader.lines()));
                                     break;
                                 }
                             };
@@ -711,6 +713,7 @@ mod log {
                                     }
                                     return Some(LogItem {
                                         time: meta.time,
+                                        filename: file_name.to_owned(),
                                         level: meta.level,
                                         content: String::from(content),
                                     });
@@ -781,6 +784,7 @@ mod log {
     #[derive(Debug, Serialize, Deserialize)]
     pub struct LogItem {
         pub time: i64,
+        pub filename: String,
         pub level: Option<Level>,
         pub content: String,
     }

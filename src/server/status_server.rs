@@ -302,16 +302,18 @@ impl StatusServer {
             None => None,
         };
         let pattern = query_pairs.get("pattern").map_or("", |s| s.borrow());
+        let filename = query_pairs.get("filename").map_or("", |s| s.borrow());
 
         match log::LogIterator::new(
             &config.log_file,
+            filename,
             start_time,
             end_time,
             level,
             pattern.to_string(),
         ) {
             Ok(iter) => {
-                #[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+                #[derive(Debug, Serialize, Deserialize)]
                 #[serde(rename_all = "lowercase")]
                 struct OpenResponse<'a> {
                     fd: &'a str,
@@ -600,6 +602,7 @@ mod log {
     impl LogIterator {
         pub fn new(
             log_file: &str,
+            filename: &str,
             start_time: i64,
             end_time: i64,
             level: Option<Level>,
@@ -632,6 +635,9 @@ mod log {
                 if !file_name.starts_with(log_name) {
                     continue;
                 }
+                if !filename.is_empty() && file_name != filename {
+                    continue;
+                }
                 // Open the file
                 let mut file = match File::open(entry.path()) {
                     Ok(file) => file,
@@ -653,7 +659,7 @@ mod log {
                     search_files.push((file_name.to_owned(), file_start_time, file));
                 }
             }
-            search_files.sort_by(|a, b| b.0.cmp(&a.0));
+            search_files.sort_by(|a, b| b.1.cmp(&a.1));
             let current_reader = search_files
                 .pop()
                 .map(|file| (file.0, BufReader::new(file.2)));

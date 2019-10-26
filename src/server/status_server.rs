@@ -271,7 +271,7 @@ impl StatusServer {
 
         let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
-        let begin_time: i64 = match query_pairs.get("begin_time") {
+        let start_time: i64 = match query_pairs.get("start_time") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
                 Err(_) => {
@@ -301,22 +301,28 @@ impl StatusServer {
             Some(val) => log::Level::from_str(val),
             None => None,
         };
-        let filter = query_pairs.get("filter").map_or("", |s| s.borrow());
+        let pattern = query_pairs.get("pattern").map_or("", |s| s.borrow());
 
         match log::LogIterator::new(
             &config.log_file,
-            begin_time,
+            start_time,
             end_time,
             level,
-            filter.to_string(),
+            pattern.to_string(),
         ) {
             Ok(iter) => {
-                let name = format!("token-{}", chrono::offset::Utc::now().timestamp_nanos());
-                log_iters.lock().unwrap().insert(name.clone(), iter);
+                #[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+                #[serde(rename_all = "lowercase")]
+                struct OpenResponse<'a> {
+                    fd: &'a str,
+                };
+                let name = format!("fd-{}", chrono::offset::Utc::now().timestamp_nanos());
+                let json = serde_json::to_string(&OpenResponse { fd: &name }).unwrap();
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(name))
+                    .body(Body::from(json))
                     .unwrap();
+                log_iters.lock().unwrap().insert(name, iter);
                 Box::new(ok(res))
             }
             Err(err) => {
@@ -336,7 +342,7 @@ impl StatusServer {
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
         let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
-        let token = query_pairs.get("token").map_or("", |s| s.borrow());
+        let fd = query_pairs.get("fd").map_or("", |s| s.borrow());
         let limit: usize = match query_pairs.get("limit") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
@@ -350,7 +356,7 @@ impl StatusServer {
             },
             None => MAX_SEARCH_LOG_RESULT_SIZE,
         };
-        match log_iters.lock().unwrap().get_mut(token) {
+        match log_iters.lock().unwrap().get_mut(fd) {
             Some(iter) => {
                 let mut counter = 0;
                 let mut results = vec![];
@@ -371,10 +377,7 @@ impl StatusServer {
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from(format!(
-                        "the {:?} dose not open or closed",
-                        token
-                    )))
+                    .body(Body::from(format!("the {:?} dose not open or closed", fd)))
                     .unwrap();
                 Box::new(ok(res))
             }
@@ -387,8 +390,8 @@ impl StatusServer {
     ) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send> {
         let query = req.uri().query().unwrap_or("");
         let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
-        let token = query_pairs.get("token").map_or("", |s| s.borrow());
-        match log_iters.lock().unwrap().remove(token) {
+        let fd = query_pairs.get("fd").map_or("", |s| s.borrow());
+        match log_iters.lock().unwrap().remove(fd) {
             Some(_) => {
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
@@ -400,10 +403,7 @@ impl StatusServer {
                 let res = Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from(format!(
-                        "the {:?} dose not open or closed",
-                        token
-                    )))
+                    .body(Body::from(format!("the {:?} dose not open or closed", fd)))
                     .unwrap();
                 Box::new(ok(res))
             }
@@ -581,11 +581,11 @@ mod log {
         search_files: Vec<(i64, File)>,
         currrent_lines: Option<std::io::Lines<BufReader<File>>>,
 
-        // filter conditions
-        begin_time: i64,
+        // pattern conditions
+        start_time: i64,
         end_time: i64,
         level: Option<Level>,
-        filter: String,
+        pattern: String,
     }
 
     #[derive(Debug)]
@@ -600,10 +600,10 @@ mod log {
     impl LogIterator {
         pub fn new(
             log_file: &str,
-            begin_time: i64,
+            start_time: i64,
             end_time: i64,
             level: Option<Level>,
-            filter: String,
+            pattern: String,
         ) -> Result<Self, LogSearchError> {
             let log_path: &Path = log_file.as_ref();
             let log_name = match log_path.file_name() {
@@ -643,8 +643,8 @@ mod log {
                     Err(_) => continue,
                 };
 
-                if (begin_time < file_start_time && end_time > file_start_time)
-                    || (end_time > file_end_time && begin_time < file_end_time)
+                if (start_time < file_start_time && end_time > file_start_time)
+                    || (end_time > file_end_time && start_time < file_end_time)
                 {
                     if let Err(err) = file.seek(SeekFrom::Start(0)) {
                         warn!("seek file failed: {}, err: {}", file_name, err);
@@ -658,10 +658,10 @@ mod log {
             Ok(Self {
                 search_files,
                 currrent_lines: current_reader.map(|reader| reader.lines()),
-                begin_time,
+                start_time,
                 end_time,
                 level,
-                filter,
+                pattern,
             })
         }
     }
@@ -700,13 +700,13 @@ mod log {
                                     if meta.time == INVALID_TIMESTAMP && meta.time > self.end_time {
                                         break;
                                     }
-                                    if meta.time < self.begin_time {
+                                    if meta.time < self.start_time {
                                         continue;
                                     }
                                     if self.level.is_some() && meta.level != self.level {
                                         continue;
                                     }
-                                    if self.filter.len() > 0 && !content.contains(&self.filter) {
+                                    if self.pattern.len() > 0 && !content.contains(&self.pattern) {
                                         continue;
                                     }
                                     return Some(LogItem {
